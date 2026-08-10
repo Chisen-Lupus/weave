@@ -24,16 +24,16 @@ def _nufft_adjoint(x, y, z, n_modes, eps=1e-8):
     z = np.ascontiguousarray(z.astype(np.complex128))
     return finufft.nufft2d1(x, y, z, n_modes, eps=eps)
 
-def _evaluate_on_grid_nufft(a_2d, n_fine):
+def _evaluate_on_grid_nufft(a_2d, n_fine_x, n_fine_y):
     """
     Reconstruct on a uniform grid using zero-padded iFFT
     """
     Nx, Ny = a_2d.shape
 
-    padded = np.zeros((n_fine, n_fine), dtype=np.complex128)
+    padded = np.zeros((n_fine_x, n_fine_y), dtype=np.complex128)
 
-    cx = n_fine//2
-    cy = n_fine//2
+    cx = n_fine_x//2
+    cy = n_fine_y//2
     hx = Nx//2
     hy = Ny//2
 
@@ -43,7 +43,7 @@ def _evaluate_on_grid_nufft(a_2d, n_fine):
     padded[x_start:x_start + Nx, y_start:y_start + Ny] = a_2d
     padded = np.fft.ifftshift(padded)
 
-    z_recon = np.fft.ifft2(padded)*(n_fine*n_fine)
+    z_recon = np.fft.ifft2(padded)*(n_fine_x*n_fine_y)
     return z_recon.real
 
 
@@ -139,11 +139,11 @@ def combine_image_nufft_from_xyz(
     x_all,
     y_all,
     z_all,
-    base_size,
+    nx_out, 
+    ny_out,
     weight_all=None,
     oversample=2,
-    enlarge=1.0,
-    Kmax=None,
+    # Kmax=None,
     max_iter=80,
     tol=1e-8,
     eps=1e-8,
@@ -181,8 +181,8 @@ def combine_image_nufft_from_xyz(
     # --------------------------------------------------
     # normalize -> [-pi, pi)
     # --------------------------------------------------
-    x_all = x_all/base_size*(2*np.pi)*enlarge
-    y_all = y_all/base_size*(2*np.pi)*enlarge
+    x_all = x_all/nx_out*(2*np.pi)
+    y_all = y_all/ny_out*(2*np.pi)
 
     mask = (
         (x_all >= -np.pi) & (x_all < np.pi) &
@@ -199,14 +199,8 @@ def combine_image_nufft_from_xyz(
     # --------------------------------------------------
     # Fourier modes
     # --------------------------------------------------
-    R_OUT = int((base_size/2)/enlarge*oversample)
-
-    if Kmax is None:
-        Kmax_x = R_OUT
-        Kmax_y = R_OUT
-    else:
-        Kmax_x = int(Kmax)
-        Kmax_y = int(Kmax)
+    Kmax_x = int((nx_out/2))
+    Kmax_y = int((ny_out/2))
 
     n_modes_x = 2*Kmax_x + odd
     n_modes_y = 2*Kmax_y + odd
@@ -234,8 +228,9 @@ def combine_image_nufft_from_xyz(
     # --------------------------------------------------
     # reconstruct
     # --------------------------------------------------
-    n_fine = R_OUT*2 + odd
-    z_recon = _evaluate_on_grid_nufft(a_2d, n_fine)
+    n_fine_x = Kmax_x*2 + odd
+    n_fine_y = Kmax_y*2 + odd
+    z_recon = _evaluate_on_grid_nufft(a_2d, n_fine_x, n_fine_y)
 
     z_recon = np.fft.fftshift(z_recon)[::-1, ::-1]
 
