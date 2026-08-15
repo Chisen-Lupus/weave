@@ -1,5 +1,5 @@
 # nufft_utils_wt_3d_mirror.py
-# 3D NUFFT weighted coadd with mirror extension in the wavelength (lam) direction
+# 3D NUFFT weighted coadd with mirror extension in the z direction
 # Reference: nufft_utils_wt.py for the 2D weighted CGNR pattern [1]
 
 import numpy as np
@@ -32,23 +32,28 @@ def _nufft3d_adjoint(x, y, z, data, n_modes, eps=1e-8):
     return finufft.nufft3d1(x, y, z, c, n_modes, eps=eps)
 
 
-def _evaluate_on_grid_3d_mirror(a_3d, n_fine_xy, n_fine_lam):
+def _evaluate_on_grid_3d_mirror(
+    a_3d,
+    n_fine_x,
+    n_fine_y,
+    n_fine_z,
+):
     """
     Reconstruct on a uniform grid using zero-padded 3D iFFT.
-    lam direction: only the [0, pi) physical half is returned.
+    z direction: only the [0, pi) physical half is returned.
     """
     Nx, Ny, Nz = a_3d.shape
 
-    # lam direction uses 2*n_fine_lam points to cover [-pi, pi),
+    # z direction uses 2*n_fine_z points to cover [-pi, pi),
     # then only the [0, pi) half is kept.
-    n_lam_full = 2 * n_fine_lam
+    n_z_full = 2 * n_fine_z
 
-    padded = np.zeros((n_fine_xy, n_fine_xy, n_lam_full),
+    padded = np.zeros((n_fine_x, n_fine_y, n_z_full),
                       dtype=np.complex128)
 
-    cx = n_fine_xy  // 2
-    cy = n_fine_xy  // 2
-    cz = n_lam_full // 2
+    cx = n_fine_x   // 2
+    cy = n_fine_y   // 2
+    cz = n_z_full   // 2
 
     x_s = cx - Nx // 2
     y_s = cy - Ny // 2
@@ -60,45 +65,45 @@ def _evaluate_on_grid_3d_mirror(a_3d, n_fine_xy, n_fine_lam):
     full_recon = np.fft.ifftn(padded) * padded.size
     full_recon = np.fft.fftshift(full_recon)
 
-    # Only keep lam in [0, pi)
-    z_recon = full_recon[:, :, n_fine_lam:2*n_fine_lam].real
+    # Only keep z in [0, pi)
+    data_recon = full_recon[:, :, n_fine_z:2*n_fine_z].real
 
-    return z_recon[::-1, ::-1, :]
+    return data_recon[::-1, ::-1, :]
 
 
 # ==============================================================
 # Mirror extension utility
 # ==============================================================
 
-def mirror_extend_lam(x, y, lam_01, data, weight=None):
+def mirror_extend_z(x, y, z_01, data, weight=None):
     """
-    Mirror-extend lam from [0,1] to [-1,1], then map to [-pi, pi).
+    Mirror-extend z from [0,1] to [-1,1], then map to [-pi, pi).
 
-    Even symmetry: f(lam) -> f(-lam) = f(lam)
-    This enforces Neumann boundary conditions in the lam direction,
-    suppressing Gibbs ringing at the lam boundaries.
+    Even symmetry: f(z) -> f(-z) = f(z)
+    This enforces Neumann boundary conditions in the z direction,
+    suppressing Gibbs ringing at the z boundaries.
 
     Parameters
     ----------
-    x, y     : 1D arrays, spatial coordinates (already in [-pi, pi))
-    lam_01   : 1D array, wavelength coordinate normalized to [0, 1]
-    data     : 1D array, sample values
-    weight   : 1D array or None, per-sample weights
+    x, y   : 1D arrays, spatial coordinates (already in [-pi, pi))
+    z_01   : 1D array, z pixel coordinate normalized to [0, 1)
+    data   : 1D array, sample values
+    weight : 1D array or None, per-sample weights
 
     Returns
     -------
-    x_ext, y_ext, lam_ext, data_ext, weight_ext
+    x_ext, y_ext, z_ext, data_ext, weight_ext
     """
-    # Original data: lam in [0,1] -> [0, pi)
-    lam_pos = lam_01 * np.pi
+    # Original data: z in [0,1) -> [0, pi)
+    z_pos = z_01 * np.pi
 
-    # Mirror copy: lam -> -lam, maps to (-pi, 0]
-    lam_neg = -lam_pos
+    # Mirror copy: z -> -z, maps to (-pi, 0]
+    z_neg = -z_pos
 
     # Concatenate original + mirror
     x_ext    = np.concatenate([x, x])
     y_ext    = np.concatenate([y, y])
-    lam_ext  = np.concatenate([lam_pos, lam_neg])
+    z_ext    = np.concatenate([z_pos, z_neg])
     data_ext = np.concatenate([data, data])  # even symmetry: same value
 
     if weight is not None:
@@ -106,7 +111,11 @@ def mirror_extend_lam(x, y, lam_01, data, weight=None):
     else:
         weight_ext = np.ones_like(data_ext, dtype=np.float64)
 
-    return x_ext, y_ext, lam_ext, data_ext, weight_ext
+    return x_ext, y_ext, z_ext, data_ext, weight_ext
+
+
+# Backward-compatible alias for callers that used the old helper name.
+mirror_extend_lam = mirror_extend_z
 
 
 # ==============================================================
@@ -114,16 +123,17 @@ def mirror_extend_lam(x, y, lam_01, data, weight=None):
 # ==============================================================
 
 def _fit_fourier_modes_3d_nufft_weighted_mirror(
-    x, y, lam_01, data, weight,
+    x, y, z_01, data, weight,
     Kmax_x, Kmax_y, Kmax_z,
     max_iter=80,
     tol=1e-8,
     eps=1e-8,
     verbose=True,
+    odd=1,
 ):
     """
     Solve  min sum_i weight_i * |(A a)_i - data_i|^2  using CGNR with 3D NUFFT,
-    after mirror-extending the lam direction.
+    after mirror-extending the z direction.
 
     This follows the weighted CGNR pattern from nufft_utils_wt.py [1]:
       - sqrt(w) is absorbed into both forward and adjoint operators
@@ -133,30 +143,35 @@ def _fit_fourier_modes_3d_nufft_weighted_mirror(
     Parameters
     ----------
     x, y       : 1D arrays, spatial coordinates in [-pi, pi)
-    lam_01     : 1D array, wavelength coordinate in [0, 1]
+    z_01       : 1D array, z pixel coordinate normalized to [0, 1)
     data       : 1D array, sample values
     weight     : 1D array, non-negative per-sample weight
     Kmax_x, Kmax_y : int, spatial max frequency
-    Kmax_z     : int, lam direction max frequency (after mirror extension)
+    Kmax_z     : int, z direction max frequency (after mirror extension)
     max_iter   : int
     tol        : float, relative residual tolerance
     eps        : float, NUFFT precision
     verbose    : bool
+    odd        : int, mode-count parity offset (normally 0 or 1)
 
     Returns
     -------
-    a_3d : (2*Kmax_x+1, 2*Kmax_y+1, 2*Kmax_z+1) complex array
+    a_3d : (2*Kmax_x+odd, 2*Kmax_y+odd, 2*Kmax_z+odd) complex array
     """
     # --- Mirror extension (doubles the data) ---
-    x_ext, y_ext, lam_ext, data_ext, weight_ext = mirror_extend_lam(
-        x, y, lam_01, data, weight
+    x_ext, y_ext, z_ext, data_ext, weight_ext = mirror_extend_z(
+        x, y, z_01, data, weight
     )
 
-    n_modes = (2*Kmax_x+1, 2*Kmax_y+1, 2*Kmax_z+1)
+    n_modes = (
+        2*Kmax_x + odd,
+        2*Kmax_y + odd,
+        2*Kmax_z + odd,
+    )
 
     x_   = np.ascontiguousarray(x_ext,    dtype=np.float64)
     y_   = np.ascontiguousarray(y_ext,    dtype=np.float64)
-    lam_ = np.ascontiguousarray(lam_ext,  dtype=np.float64)
+    z_   = np.ascontiguousarray(z_ext,    dtype=np.float64)
     d    = np.ascontiguousarray(data_ext, dtype=np.complex128)
     w    = np.ascontiguousarray(weight_ext, dtype=np.float64)
 
@@ -175,11 +190,11 @@ def _fit_fourier_modes_3d_nufft_weighted_mirror(
 
     def forward_w(a_3d):
         """A_w a = sqrt(W) * A a"""
-        return sqrt_w * _nufft3d_forward(x_, y_, lam_, a_3d, eps=eps)
+        return sqrt_w * _nufft3d_forward(x_, y_, z_, a_3d, eps=eps)
 
     def adjoint_w(v):
         """A_w^H v = A^H (sqrt(W) * v)"""
-        return _nufft3d_adjoint(x_, y_, lam_, sqrt_w * v, n_modes, eps=eps)
+        return _nufft3d_adjoint(x_, y_, z_, sqrt_w * v, n_modes, eps=eps)
 
     # --- Weighted CGNR iteration [1] ---
     a = np.zeros(n_modes, dtype=np.complex128, order='C')
@@ -240,7 +255,7 @@ def extract_physical_spectrum(a_3d, Kmax_z):
     """
     Extract even (cosine) modes from mirror-extended Fourier coefficients.
 
-    Mirror symmetry means only cos components in the lam direction
+    Mirror symmetry means only cos components in the z direction
     are physical; sin components should be ~zero.
 
     Returns
@@ -267,90 +282,96 @@ def extract_physical_spectrum(a_3d, Kmax_z):
 # ==============================================================
 
 def combine_cube_nufft_mirror_weighted(
-    x_all, y_all, lam_all, z_all,
-    base_size,
+    x_all, y_all, z_all, data_all,
+    nx_out,
+    ny_out,
+    nz_out,
     weight_all=None,
-    oversample=2,
-    enlarge=1.0,
-    Kmax_xy=None,
-    Kmax_z=None,
+    # oversample=2,
     max_iter=80,
     tol=1e-8,
     eps=1e-8,
     verbose=True,
+    odd=1,
 ):
     """
-    3D NUFFT weighted reconstruction with mirror extension in lam direction.
+    3D NUFFT weighted reconstruction with mirror extension in the z direction.
 
     Follows the interface pattern of combine_image_nufft_from_xyz
     in nufft_utils_wt.py [1], extended to 3D with mirror boundary
-    conditions in the wavelength axis.
+    conditions in the z axis.
 
     Parameters
     ----------
-    x_all, y_all : 1D arrays, spatial sample coordinates
-    lam_all      : 1D array, wavelength values (physical units)
-    z_all        : 1D array, sample values
-    base_size    : float, spatial coordinate normalization scale
+    x_all, y_all : 1D arrays
+        Spatial pixel coordinates in [0, nx_out) and [0, ny_out).
+    z_all        : 1D array, z pixel coordinates in [0, nz_out)
+    data_all     : 1D array, sample values
+    nx_out, ny_out : float
+        Coordinate normalization scales and target sizes for the spatial axes.
+    nz_out       : float
+        Coordinate normalization scale and target size for the z axis.
     weight_all   : 1D array or None
         Per-sample weights for weighted least squares.
         If None, uniform weighting is used.
-    oversample   : float, oversampling factor for spatial axes
-    enlarge      : float, field-of-view enlargement factor
-    Kmax_xy      : int or None, max spatial frequency (auto if None)
-    Kmax_z       : int or None, max lam frequency (auto if None)
+    oversample   : float
+        Retained for API consistency with the 2D reconstruction interface.
     max_iter     : int
     tol          : float
     eps          : float, NUFFT precision
     verbose      : bool
+    odd          : int, mode-count parity offset (normally 0 or 1)
 
     Returns
     -------
-    z_recon_3d : 3D real array, reconstructed data cube
-    a_3d       : 3D complex array, Fourier coefficients (mirror-extended)
+    data_recon_3d : 3D real array, reconstructed data cube
+    a_3d          : 3D complex array, Fourier coefficients (mirror-extended)
     """
-    x_all   = np.asarray(x_all).ravel()
-    y_all   = np.asarray(y_all).ravel()
-    lam_all = np.asarray(lam_all).ravel()
-    z_all   = np.asarray(z_all).ravel()
+    x_all    = np.asarray(x_all).ravel()
+    y_all    = np.asarray(y_all).ravel()
+    z_all    = np.asarray(z_all).ravel()
+    data_all = np.asarray(data_all).ravel()
 
     if weight_all is None:
-        weight_all = np.ones_like(z_all, dtype=np.float64)
+        weight_all = np.ones_like(data_all, dtype=np.float64)
     else:
         weight_all = np.asarray(weight_all).ravel().astype(np.float64)
 
     if not (x_all.shape == y_all.shape == z_all.shape
-            == lam_all.shape == weight_all.shape):
+            == data_all.shape == weight_all.shape):
         raise ValueError(
-            'x_all, y_all, lam_all, z_all, and weight_all '
+            'x_all, y_all, z_all, data_all, and weight_all '
             'must have the same shape'
         )
     if np.any(weight_all < 0):
         raise ValueError('weight_all must be non-negative')
+    if not all(
+        np.isscalar(size) and np.isfinite(size) and size > 0
+        for size in (nx_out, ny_out, nz_out)
+    ):
+        raise ValueError('nx_out, ny_out, and nz_out must be positive')
+    if odd not in (0, 1):
+        raise ValueError('odd must be 0 or 1')
 
     # --------------------------------------------------
-    # Normalize spatial coords to [-pi, pi)
+    # Normalize WCS pixel coordinates:
+    # x/y: [0, size) -> [-pi, pi); z: [0, nz_out) -> [0, 1).
     # --------------------------------------------------
-    x_all = x_all / base_size * (2 * np.pi) * enlarge
-    y_all = y_all / base_size * (2 * np.pi) * enlarge
+    x_all = x_all / nx_out * (2 * np.pi) - np.pi
+    y_all = y_all / ny_out * (2 * np.pi) - np.pi
+    z_01 = z_all / nz_out
 
-    # Normalize lam to [0, 1]
-    lam_min, lam_max = lam_all.min(), lam_all.max()
-    if lam_max > lam_min:
-        lam_01 = (lam_all - lam_min) / (lam_max - lam_min)
-    else:
-        lam_01 = np.zeros_like(lam_all)
-
-    # Spatial canvas mask
+    # Reconstruction canvas mask
     mask = (
         (x_all >= -np.pi) & (x_all < np.pi) &
-        (y_all >= -np.pi) & (y_all < np.pi)
+        (y_all >= -np.pi) & (y_all < np.pi) &
+        (z_01 >= 0.0) & (z_01 < 1.0)
     )
 
     x_all      = x_all[mask]
     y_all      = y_all[mask]
-    z_all      = z_all[mask]
-    lam_01     = lam_01[mask]
+    z_01       = z_01[mask]
+    data_all   = data_all[mask]
     weight_all = weight_all[mask]
 
     M = len(x_all)
@@ -358,24 +379,13 @@ def combine_cube_nufft_mirror_weighted(
     # --------------------------------------------------
     # Fourier mode counts
     # --------------------------------------------------
-    R_OUT = int((base_size / 2) / enlarge * oversample)
+    Kmax_x = int(nx_out / 2)
+    Kmax_y = int(ny_out / 2)
+    Kmax_z = int(nz_out / 2)
 
-    if Kmax_xy is None:
-        Kmax_x = R_OUT
-        Kmax_y = R_OUT
-    else:
-        Kmax_x = int(Kmax_xy)
-        Kmax_y = int(Kmax_xy)
-
-    if Kmax_z is None:
-        # Default: use R_OUT for lam as well (user should override)
-        _Kmax_z = R_OUT
-    else:
-        _Kmax_z = int(Kmax_z)
-
-    n_modes_x = 2 * Kmax_x + 1
-    n_modes_y = 2 * Kmax_y + 1
-    n_modes_z = 2 * _Kmax_z + 1
+    n_modes_x = 2 * Kmax_x + odd
+    n_modes_y = 2 * Kmax_y + odd
+    n_modes_z = 2 * Kmax_z + odd
     N_modes   = n_modes_x * n_modes_y * n_modes_z
 
     if verbose:
@@ -390,26 +400,33 @@ def combine_cube_nufft_mirror_weighted(
     # Weighted 3D NUFFT solve with mirror extension
     # --------------------------------------------------
     a_3d = _fit_fourier_modes_3d_nufft_weighted_mirror(
-        x_all, y_all, lam_01, z_all, weight_all,
-        Kmax_x, Kmax_y, _Kmax_z,
+        x_all, y_all, z_01, data_all, weight_all,
+        Kmax_x, Kmax_y, Kmax_z,
         max_iter=max_iter,
         tol=tol,
         eps=eps,
         verbose=verbose,
+        odd=odd,
     )
 
     # --------------------------------------------------
     # Reconstruct on grid
     # --------------------------------------------------
-    n_fine_xy  = 2 * R_OUT + 1
-    n_fine_lam = 2 * _Kmax_z + 1
-    z_recon_3d = _evaluate_on_grid_3d_mirror(a_3d, n_fine_xy, n_fine_lam)
+    n_fine_x   = 2 * Kmax_x + odd
+    n_fine_y   = 2 * Kmax_y + odd
+    n_fine_z   = 2 * Kmax_z + odd
+    data_recon_3d = _evaluate_on_grid_3d_mirror(
+        a_3d,
+        n_fine_x,
+        n_fine_y,
+        n_fine_z,
+    )
 
     if verbose:
-        print(f'cube size:      {z_recon_3d.shape}')
-        print(f'oversample:     {oversample}')
+        print(f'cube size:      {data_recon_3d.shape}')
+        # print(f'oversample:     {oversample}')
 
-    return z_recon_3d, a_3d
+    return data_recon_3d, a_3d
 
 
 # ==============================================================
@@ -443,27 +460,27 @@ def check_mirror_symmetry(a_3d, Kmax_z, verbose=True):
     return ratio
 
 
-def compute_residual(x_all, y_all, lam_01, z_all, weight_all, a_3d,
+def compute_residual(x_all, y_all, z_01, data_all, weight_all, a_3d,
                      verbose=True):
     """
     Compute weighted and unweighted prediction errors on original samples.
     """
-    x_ext, y_ext, lam_ext, data_ext, weight_ext = mirror_extend_lam(
-        x_all, y_all, lam_01, z_all, weight_all
+    x_ext, y_ext, z_ext, data_ext, weight_ext = mirror_extend_z(
+        x_all, y_all, z_01, data_all, weight_all
     )
 
-    M = len(z_all)
+    M = len(data_all)
 
-    z_pred_ext = _nufft3d_forward(
+    data_pred_ext = _nufft3d_forward(
         np.ascontiguousarray(x_ext, dtype=np.float64),
         np.ascontiguousarray(y_ext, dtype=np.float64),
-        np.ascontiguousarray(lam_ext, dtype=np.float64),
+        np.ascontiguousarray(z_ext, dtype=np.float64),
         a_3d
     )
 
     # Only the first half is the original (non-mirrored) data
-    z_pred = z_pred_ext[:M]
-    err = np.abs(z_pred - z_all)
+    data_pred = data_pred_ext[:M]
+    err = np.abs(data_pred - data_all)
 
     if verbose:
         print(f"Max  error: {err.max():.2e}")
@@ -473,5 +490,4 @@ def compute_residual(x_all, y_all, lam_01, z_all, weight_all, a_3d,
             print(f"Weighted RMS error: "
                   f"{np.sqrt(np.mean(w_err**2)):.2e}")
 
-    return z_pred, err
-
+    return data_pred, err
